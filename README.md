@@ -100,5 +100,4 @@ FoxyDeviceBridge.speak("Document saved successfully", "en-US");
 
 - htmxs.js - Full source code with inline comments
 - htmxs.min.js - Production minified build
-- description.txt - Short project summary
 
