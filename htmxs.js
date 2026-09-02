@@ -1,0 +1,653 @@
+/**
+ * HTMXS v3.0.0 - Official FoxyUI JavaScript Extension
+ * 
+ * Features:
+ * 1. Targeted Granular Micro-Updates (addClass, removeClass, setAttribute, removeAttribute)
+ * 2. DOM Morphing Algorithm (htmxs-update="morph")
+ * 3. Dynamic Lazy Script & Asset Loading
+ * 4. Embedded <script> Execution inside OOB fragments
+ * 5. SSE & WebSocket Session Reconnection & Resync Ping
+ * 6. Native Dialog/Modal/Toast Auto-Mount
+ * 7. Value Restoration for Active Form Controls
+ * 8. FoxyDeviceBridge - Native Device APIs & Hardware Sensors (Haptics, Geolocation, Battery, Speech, Clipboard, Share, WakeLock, Shake, QR Scanner)
+ */
+(function () {
+    'use strict';
+
+    // Warm-up SpeechSynthesis voices
+    if ('speechSynthesis' in window) {
+        try {
+            window.speechSynthesis.getVoices();
+            if (window.speechSynthesis.onvoiceschanged !== undefined) {
+                window.speechSynthesis.onvoiceschanged = function () {
+                    window.speechSynthesis.getVoices();
+                };
+            }
+        } catch (e) {}
+    }
+
+    function morphNodes(oldNode, newNode) {
+        if (!oldNode || !newNode) return;
+
+        // 1. Morph Attributes & Values
+        if (oldNode.nodeType === Node.ELEMENT_NODE && newNode.nodeType === Node.ELEMENT_NODE) {
+            // Remove attributes not in new node
+            Array.from(oldNode.attributes).forEach(function (attr) {
+                if (!newNode.hasAttribute(attr.name)) {
+                    oldNode.removeAttribute(attr.name);
+                }
+            });
+
+            // Set new or changed attributes
+            Array.from(newNode.attributes).forEach(function (attr) {
+                if (oldNode.getAttribute(attr.name) !== attr.value) {
+                    oldNode.setAttribute(attr.name, attr.value);
+                }
+            });
+
+            // Form inputs: Preserving user cursor / active typing state
+            if (oldNode.matches && oldNode.matches('input, textarea, select')) {
+                var isFocused = (document.activeElement === oldNode);
+                var forceVal = newNode.getAttribute('hx-oob-force-value');
+                if (forceVal !== null) {
+                    oldNode.value = forceVal;
+                } else if (!isFocused) {
+                    var newVal = newNode.getAttribute('value');
+                    if (newVal !== null && oldNode.defaultValue !== newVal) {
+                        oldNode.defaultValue = newVal;
+                        oldNode.value = newVal;
+                    }
+                }
+                if (oldNode.type === 'checkbox' || oldNode.type === 'radio') {
+                    oldNode.checked = newNode.checked;
+                }
+            }
+        }
+
+        // 2. Morph child nodes recursively
+        var oldChildren = Array.from(oldNode.childNodes);
+        var newChildren = Array.from(newNode.childNodes);
+        var maxLen = Math.max(oldChildren.length, newChildren.length);
+
+        for (var k = 0; k < maxLen; k++) {
+            var oChild = oldChildren[k];
+            var nChild = newChildren[k];
+
+            if (!oChild && nChild) {
+                oldNode.appendChild(nChild.cloneNode(true));
+            } else if (oChild && !nChild) {
+                oldNode.removeChild(oChild);
+            } else if (oChild && nChild) {
+                if (oChild.nodeType === Node.TEXT_NODE && nChild.nodeType === Node.TEXT_NODE) {
+                    if (oChild.nodeValue !== nChild.nodeValue) {
+                        oChild.nodeValue = nChild.nodeValue;
+                    }
+                } else if (oChild.nodeName === nChild.nodeName) {
+                    morphNodes(oChild, nChild);
+                } else {
+                    oldNode.replaceChild(nChild.cloneNode(true), oChild);
+                }
+            }
+        }
+    }
+
+    function mountMissingElement(elt) {
+        if (!elt || !elt.id) return;
+        var targetId = elt.id;
+        var existing = document.getElementById(targetId);
+        if (existing) {
+            existing.replaceWith(elt);
+            htmx.process(elt);
+        } else {
+            var container = document.getElementById('foxy-dialog-portal') || document.getElementById('foxy-app') || document.body;
+            if (container) {
+                var clone = elt.cloneNode(true);
+                clone.removeAttribute('hx-swap-oob');
+                clone.removeAttribute('htmxs-update');
+                container.appendChild(clone);
+                htmx.process(clone);
+            }
+        }
+    }
+
+    function processMicroUpdate(targetEl, updateCmd) {
+        if (!targetEl || !updateCmd) return false;
+        if (updateCmd.startsWith('addClass:')) {
+            targetEl.classList.add(updateCmd.substring(9).trim());
+            return true;
+        } else if (updateCmd.startsWith('removeClass:')) {
+            targetEl.classList.remove(updateCmd.substring(12).trim());
+            return true;
+        } else if (updateCmd.startsWith('setAttribute:')) {
+            var parts = updateCmd.substring(13).split(':');
+            if (parts.length >= 2) {
+                var k = parts[0].trim();
+                var v = parts.slice(1).join(':').trim();
+                targetEl.setAttribute(k, v);
+                if (k === 'disabled') targetEl.disabled = (v !== 'false');
+                if (targetEl.matches && targetEl.matches('input, textarea, select') && k === 'value') {
+                    targetEl.value = v;
+                }
+            }
+            return true;
+        } else if (updateCmd.startsWith('removeAttribute:')) {
+            var k = updateCmd.substring(16).trim();
+            targetEl.removeAttribute(k);
+            if (k === 'disabled') targetEl.disabled = false;
+            return true;
+        }
+        return false;
+    }
+
+    function processResponseText(text) {
+        if (!text || typeof text !== 'string' || text.indexOf('htmxs-update') === -1) {
+            return text;
+        }
+
+        var parser = new DOMParser();
+        var doc = parser.parseFromString('<body>' + text + '</body>', 'text/html');
+        var microNodes = doc.querySelectorAll('[htmxs-update]');
+
+        if (microNodes.length === 0) {
+            return text;
+        }
+
+        microNodes.forEach(function (mNode) {
+            var targetId = mNode.id;
+            var updateCmd = mNode.getAttribute('htmxs-update');
+            var targetEl = targetId ? document.getElementById(targetId) : null;
+
+            if (targetEl && updateCmd) {
+                if (updateCmd.startsWith('addClass:')) {
+                    targetEl.classList.add(updateCmd.substring(9).trim());
+                } else if (updateCmd.startsWith('removeClass:')) {
+                    targetEl.classList.remove(updateCmd.substring(12).trim());
+                } else if (updateCmd.startsWith('setAttribute:')) {
+                    var parts = updateCmd.substring(13).split(':');
+                    if (parts.length >= 2) {
+                        var k = parts[0].trim();
+                        var v = parts.slice(1).join(':').trim();
+                        targetEl.setAttribute(k, v);
+                        if (k === 'disabled') targetEl.disabled = (v !== 'false');
+                        if (targetEl.matches && targetEl.matches('input, textarea, select') && k === 'value') {
+                            targetEl.value = v;
+                        }
+                    }
+                } else if (updateCmd.startsWith('removeAttribute:')) {
+                    var k = updateCmd.substring(16).trim();
+                    targetEl.removeAttribute(k);
+                    if (k === 'disabled') targetEl.disabled = false;
+                } else if (updateCmd === 'morph') {
+                    morphNodes(targetEl, mNode);
+                    if (window.htmx) {
+                        htmx.process(targetEl);
+                    }
+                }
+            }
+            mNode.remove();
+        });
+
+        return doc.body.innerHTML;
+    }
+
+    // HTMX Extension Registration
+    htmx.defineExtension('htmxs', {
+        transformResponse: function (text, xhr, elt) {
+            return processResponseText(text);
+        },
+        onEvent: function (name, evt) {
+            // 1. Feature 1 & 2: Micro-Updates and Morphing
+            if (name === 'htmx:beforeOnLoad') {
+                if (evt.detail && evt.detail.serverResponse) {
+                    evt.detail.serverResponse = processResponseText(evt.detail.serverResponse);
+                }
+            }
+
+            // 2. Feature 4 & 7: Script execution & Form value restoration after swap
+            if (name === 'htmx:afterSwap') {
+                var target = evt.detail.target;
+                if (target) {
+                    var syncInputs = function (root) {
+                        var inputs = root.querySelectorAll('input, textarea, select');
+                        for (var i = 0; i < inputs.length; i++) {
+                            var inp = inputs[i];
+                            var forceAttr = inp.getAttribute('value');
+                            var attrVal = inp.getAttribute('data-foxy-value');
+                            var valToSet = forceAttr !== null ? forceAttr : attrVal;
+                            if (valToSet !== null) {
+                                inp.value = valToSet;
+                            }
+                        }
+                    };
+
+                    syncInputs(target);
+                    requestAnimationFrame(function () { syncInputs(target); });
+                    setTimeout(function () { syncInputs(target); }, 20);
+
+                    if (target.querySelectorAll) {
+                        var scripts = target.querySelectorAll('script');
+                        for (var k = 0; k < scripts.length; k++) {
+                            var scriptEl = scripts[k];
+                            if (scriptEl.type === '' || scriptEl.type === 'text/javascript') {
+                                try {
+                                    new Function(scriptEl.textContent)();
+                                } catch (e) {
+                                    console.error('HTMXS Script Execution Error:', e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Feature 5: SSE & WebSocket Session Reconnection & Resync Ping
+            if (name === 'htmx:sseOpen' || name === 'htmx:wsOpen' || name === 'htmx:sseReconnect') {
+                var pageIdMatch = window.location.pathname.match(/\/([^\/]+)$/);
+                var pageId = pageIdMatch ? pageIdMatch[1] : '';
+                if (pageId) {
+                    htmx.ajax('POST', window.FoxyDeviceBridge.getEventUrl() + '?eventType=resync&pageId=' + pageId, {
+                        swap: 'none'
+                    });
+                }
+            }
+        }
+    });
+
+    // Auto-enable htmxs extension on body if present
+    document.addEventListener('DOMContentLoaded', function () {
+        if (document.body && !document.body.getAttribute('hx-ext')) {
+            document.body.setAttribute('hx-ext', 'htmxs');
+        }
+    });
+
+    // Global Auto-Mount for missing OOB elements (Modals, Dialogs, Toasts)
+    document.addEventListener('htmx:oobErrorNoTarget', function (event) {
+        var elt = event.detail.content || event.detail.elt;
+        mountMissingElement(elt);
+    });
+
+    // Global Response Interception for Micro-Updates and Morphing
+    document.addEventListener('htmx:beforeOnLoad', function (event) {
+        if (event.detail && event.detail.serverResponse) {
+            event.detail.serverResponse = processResponseText(event.detail.serverResponse);
+        }
+    });
+
+    // Global CSRF Header Injection for all HTMX requests
+    document.addEventListener('htmx:configRequest', function(evt) {
+        var meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta && meta.content) {
+            evt.detail.headers['X-CSRF-TOKEN'] = meta.content;
+        }
+    });
+
+    // Global Listener for HX-Trigger device commands dispatched by HTMX
+    document.addEventListener('foxy:device', function (event) {
+        if (event.detail && window.FoxyDeviceBridge) {
+            window.FoxyDeviceBridge.executeCommands(event.detail);
+        }
+    });
+
+    // ==========================================
+    // 8. FoxyDeviceBridge - Hardware Sensors & Native Device APIs
+    // ==========================================
+    window.FoxyDeviceBridge = {
+        getEventUrl: function () {
+            var meta = document.querySelector('meta[name="foxy-context-path"]');
+            var cp = meta ? meta.content : '';
+            if (!cp) {
+                var pathParts = window.location.pathname.split('/').filter(Boolean);
+                if (pathParts.length > 1) {
+                    cp = '/' + pathParts[0];
+                }
+            }
+            return (cp || '') + '/foxy/event';
+        },
+        getPageId: function () {
+            var m = window.location.pathname.match(/\/([^\/]+)$/);
+            return m ? m[1] : '';
+        },
+        speakText: function (payload) {
+            if (!('speechSynthesis' in window)) {
+                alert('Sinteza vocală nu este suportată în acest browser.');
+                return;
+            }
+            var text = (typeof payload === 'string') ? payload : (payload.text || '');
+            if (!text) return;
+            var reqLang = (payload.lang || 'ro-RO').replace('_', '-');
+            var langPrefix = reqLang.split('-')[0].toLowerCase();
+
+            try {
+                window.speechSynthesis.resume();
+                if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+                    window.speechSynthesis.cancel();
+                }
+
+                var u = new SpeechSynthesisUtterance(text);
+                u.lang = reqLang;
+                if (payload.rate) u.rate = parseFloat(payload.rate);
+                if (payload.pitch) u.pitch = parseFloat(payload.pitch);
+
+                var voices = window.speechSynthesis.getVoices() || [];
+                if (voices.length > 0) {
+                    var matched = null;
+                    for (var i = 0; i < voices.length; i++) {
+                        if (voices[i].lang && voices[i].lang.toLowerCase() === reqLang.toLowerCase()) {
+                            matched = voices[i];
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        for (var j = 0; j < voices.length; j++) {
+                            if (voices[j].lang && voices[j].lang.toLowerCase().startsWith(langPrefix)) {
+                                matched = voices[j];
+                                break;
+                            }
+                        }
+                    }
+                    if (!matched) {
+                        for (var k = 0; k < voices.length; k++) {
+                            var vname = (voices[k].name || '').toLowerCase();
+                            if (langPrefix === 'ro' && (vname.indexOf('român') > -1 || vname.indexOf('romanian') > -1)) {
+                                matched = voices[k];
+                                break;
+                            } else if (langPrefix === 'en' && vname.indexOf('english') > -1) {
+                                matched = voices[k];
+                                break;
+                            }
+                        }
+                    }
+                    if (matched) {
+                        u.voice = matched;
+                        u.lang = matched.lang;
+                    }
+                }
+
+                window._foxyCurrentUtterance = u;
+                u.onend = function () {
+                    window._foxyCurrentUtterance = null;
+                };
+                u.onerror = function (e) {
+                    window._foxyCurrentUtterance = null;
+                    if (e && e.error !== 'canceled') {
+                        console.warn('SpeechSynthesis error:', e);
+                    }
+                };
+
+                window.speechSynthesis.speak(u);
+                window.speechSynthesis.resume();
+            } catch (err) {
+                console.error('SpeechSynthesis error:', err);
+            }
+        },
+        executeCommands: function (cmds) {
+            if (!cmds) return;
+            if (cmds.value) cmds = cmds.value;
+            if (Array.isArray(cmds)) {
+                for (var i = 0; i < cmds.length; i++) {
+                    this.executeCommand(cmds[i]);
+                }
+            } else {
+                this.executeCommand(cmds);
+            }
+        },
+        executeCommand: function (cmd) {
+            if (!cmd || !cmd.action) return;
+            var payload = cmd.payload || {};
+            switch (cmd.action) {
+                case 'vibrate':
+                    if ('vibrate' in navigator) {
+                        navigator.vibrate(payload.duration || 100);
+                    }
+                    break;
+                case 'vibratePattern':
+                    if ('vibrate' in navigator && payload.pattern) {
+                        navigator.vibrate(payload.pattern);
+                    }
+                    break;
+                case 'clipboardWrite':
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(payload.text || '');
+                    }
+                    break;
+                case 'clipboardRead':
+                    if (navigator.clipboard && navigator.clipboard.readText) {
+                        navigator.clipboard.readText().then(function(text) {
+                            var el = document.getElementById('device-clipboard-input') || document.querySelector('[data-foxy-clipboard]');
+                            if (el) {
+                                el.value = text;
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                            }
+                        }).catch(function(err) {
+                            console.warn('Clipboard read error:', err);
+                        });
+                    }
+                    break;
+                case 'share':
+                    if (navigator.share) {
+                        navigator.share({
+                            title: payload.title || '',
+                            text: payload.text || '',
+                            url: payload.url || window.location.href
+                        }).catch(function() {});
+                    } else {
+                        alert('Web Share API nu este disponibil în acest browser desktop (necesită HTTPS sau mobil).');
+                    }
+                    break;
+                case 'speechSpeak':
+                    window.FoxyDeviceBridge.speakText(payload);
+                    break;
+                case 'speechCancel':
+                    if ('speechSynthesis' in window) {
+                        try {
+                            window.speechSynthesis.cancel();
+                            window._foxyCurrentUtterance = null;
+                        } catch (e) {}
+                    }
+                    break;
+                case 'wakeLock':
+                    if ('wakeLock' in navigator) {
+                        if (payload.active) {
+                            navigator.wakeLock.request('screen').then(function(lock) {
+                                window._foxyWakeLock = lock;
+                            }).catch(function(e) { console.warn('WakeLock error:', e); });
+                        } else if (window._foxyWakeLock) {
+                            window._foxyWakeLock.release().then(function() {
+                                window._foxyWakeLock = null;
+                            });
+                        }
+                    }
+                    break;
+                case 'setBadge':
+                    if ('setAppBadge' in navigator) {
+                        navigator.setAppBadge(payload.count || 0).catch(function(e) {});
+                    }
+                    break;
+                case 'clearBadge':
+                    if ('clearAppBadge' in navigator) {
+                        navigator.clearAppBadge().catch(function(e) {});
+                    }
+                    break;
+                case 'getBatteryStatus':
+                    if ('getBattery' in navigator) {
+                        navigator.getBattery().then(function(b) {
+                            var target = document.getElementById('btn-get-battery') || document.querySelector('[data-foxy-battery]');
+                            if (target) {
+                                htmx.ajax('POST', window.FoxyDeviceBridge.getEventUrl(), {
+                                    target: target,
+                                    values: {
+                                        triggerId: target.id,
+                                        eventType: 'batteryReport',
+                                        pageId: window.FoxyDeviceBridge.getPageId(),
+                                        level: b.level,
+                                        charging: b.charging,
+                                        chargingTime: b.chargingTime,
+                                        dischargingTime: b.dischargingTime
+                                    }
+                                });
+                            }
+                        }).catch(function(e) { console.warn('Battery error:', e); });
+                    } else {
+                        alert('Battery API nu este suportat în acest browser (este suportat pe Chrome/Edge/Android).');
+                    }
+                    break;
+                case 'getGeolocation':
+                    if ('geolocation' in navigator) {
+                        navigator.geolocation.getCurrentPosition(function(pos) {
+                            var target = document.getElementById('btn-get-geo') || document.querySelector('[data-foxy-geo]');
+                            if (target) {
+                                htmx.ajax('POST', window.FoxyDeviceBridge.getEventUrl(), {
+                                    target: target,
+                                    values: {
+                                        triggerId: target.id,
+                                        eventType: 'geoReport',
+                                        pageId: window.FoxyDeviceBridge.getPageId(),
+                                        lat: pos.coords.latitude,
+                                        lon: pos.coords.longitude,
+                                        accuracy: pos.coords.accuracy,
+                                        altitude: pos.coords.altitude || '',
+                                        speed: pos.coords.speed || '',
+                                        heading: pos.coords.heading || '',
+                                        timestamp: pos.timestamp
+                                    }
+                                });
+                            }
+                        }, function(err) {
+                            console.warn('Geolocation error:', err);
+                            alert('Eroare la citirea GPS: ' + err.message + '. Verificați permisiunile browserului.');
+                        }, { enableHighAccuracy: !!payload.highAccuracy, timeout: 10000 });
+                    } else {
+                        alert('Geolocation API nu este disponibil în browser.');
+                    }
+                    break;
+                case 'enableShake':
+                    window.FoxyDeviceBridge.setupShake(payload.threshold || 15.0);
+                    break;
+                case 'disableShake':
+                    window.FoxyDeviceBridge.removeShake();
+                    break;
+            }
+        },
+        setupShake: function(threshold) {
+            if (window._foxyShakeHandler) return;
+            var lastX = null, lastY = null, lastZ = null;
+            var lastTime = 0;
+            window._foxyShakeHandler = function(e) {
+                var acc = e.accelerationIncludingGravity || e.acceleration;
+                if (!acc) return;
+                var now = Date.now();
+                if ((now - lastTime) > 300) {
+                    var diffTime = now - lastTime;
+                    lastTime = now;
+                    if (lastX !== null) {
+                        var delta = Math.abs(acc.x + acc.y + acc.z - lastX - lastY - lastZ) / diffTime * 10000;
+                        if (delta > (threshold * 30)) {
+                            var shakeTarget = document.querySelector('[data-foxy-shake]') || document.getElementById('btn-shake-target');
+                            if (shakeTarget) {
+                                htmx.ajax('POST', window.FoxyDeviceBridge.getEventUrl(), {
+                                    target: shakeTarget,
+                                    values: {
+                                        triggerId: shakeTarget.id,
+                                        eventType: 'shake',
+                                        pageId: window.FoxyDeviceBridge.getPageId()
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    lastX = acc.x; lastY = acc.y; lastZ = acc.z;
+                }
+            };
+            window.addEventListener('devicemotion', window._foxyShakeHandler, false);
+        },
+        removeShake: function() {
+            if (window._foxyShakeHandler) {
+                window.removeEventListener('devicemotion', window._foxyShakeHandler, false);
+                window._foxyShakeHandler = null;
+            }
+        },
+        startQrScanner: function(scannerId) {
+            var container = document.getElementById(scannerId);
+            if (!container) return;
+            var video = container.querySelector('.qr-video');
+            var placeholder = container.querySelector('.qr-placeholder');
+            var overlay = container.querySelector('.qr-overlay');
+            var btnStart = container.querySelector('.btn-start-qr');
+            var btnStop = container.querySelector('.btn-stop-qr');
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert('Camera nu este suportată în acest context de securitate (necesită HTTPS sau localhost).');
+                return;
+            }
+
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(function(stream) {
+                window._foxyQrStream = stream;
+                video.srcObject = stream;
+                video.style.display = 'block';
+                if (placeholder) placeholder.style.display = 'none';
+                if (overlay) overlay.style.display = 'block';
+                if (btnStart) btnStart.style.display = 'none';
+                if (btnStop) btnStop.style.display = 'inline-block';
+                video.play();
+
+                if ('BarcodeDetector' in window) {
+                    var detector = new BarcodeDetector({ formats: ['qr_code', 'ean_13', 'code_128'] });
+                    var interval = setInterval(function() {
+                        if (!video.srcObject) { clearInterval(interval); return; }
+                        detector.detect(video).then(function(codes) {
+                            if (codes && codes.length > 0) {
+                                var rawValue = codes[0].rawValue;
+                                clearInterval(interval);
+                                window.FoxyDeviceBridge.stopQrScanner(scannerId);
+                                htmx.ajax('POST', window.FoxyDeviceBridge.getEventUrl(), {
+                                    target: container,
+                                    values: {
+                                        triggerId: scannerId,
+                                        eventType: 'qrCodeScanned',
+                                        pageId: window.FoxyDeviceBridge.getPageId(),
+                                        code: rawValue
+                                    }
+                                });
+                            }
+                        }).catch(function() {});
+                    }, 500);
+                }
+            }).catch(function(err) {
+                alert('Eroare acces cameră: ' + err.message);
+            });
+        },
+        stopQrScanner: function(scannerId) {
+            var container = document.getElementById(scannerId);
+            if (window._foxyQrStream) {
+                window._foxyQrStream.getTracks().forEach(function(t) { t.stop(); });
+                window._foxyQrStream = null;
+            }
+            if (container) {
+                var video = container.querySelector('.qr-video');
+                var placeholder = container.querySelector('.qr-placeholder');
+                var overlay = container.querySelector('.qr-overlay');
+                var btnStart = container.querySelector('.btn-start-qr');
+                var btnStop = container.querySelector('.btn-stop-qr');
+                if (video) { video.srcObject = null; video.style.display = 'none'; }
+                if (placeholder) placeholder.style.display = 'block';
+                if (overlay) overlay.style.display = 'none';
+                if (btnStart) btnStart.style.display = 'inline-block';
+                if (btnStop) btnStop.style.display = 'none';
+            }
+        }
+    };
+
+    // HTMXS Public Global Package API
+    window.htmxs = window.htmxs || {};
+    window.htmxs.version = "3.0";
+    window.htmxs.getVersion = function() {
+        return "3.0";
+    };
+    window.htmxs.printVersion = function() {
+        var msg = "HTMXS Version 3.0";
+        console.log(msg);
+        return msg;
+    };
+
+    console.log('⚡ HTMXS v3.0 All 8 Core Features Active (FoxyUI Extension + FoxyDeviceBridge).');
+})();
